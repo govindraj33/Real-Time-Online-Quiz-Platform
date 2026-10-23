@@ -1,0 +1,180 @@
+import { useEffect, useMemo, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { api } from '../api/client.js';
+import QuestionCard from '../components/questioncard.jsx';
+import Timer from '../components/timer.jsx';
+import { useAppState } from '../state/quizstate.js';
+import { emitSocket, getSocket } from '../socket/socketclient.js';
+
+function QuizPage() {
+  const { roomId } = useParams();
+  const navigate = useNavigate();
+  const { token, user, socketStatus } = useAppState();
+  const [room, setRoom] = useState(null);
+  const [questions, setQuestions] = useState([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [selectedOption, setSelectedOption] = useState(null);
+  const [result, setResult] = useState(null);
+  const [secondsRemaining, setSecondsRemaining] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  const loadQuiz = async () => {
+    try {
+      const roomResponse = await api.getRoom(token, roomId);
+      const activeRoom = roomResponse.data;
+      setRoom(activeRoom);
+
+      if (activeRoom.state === 'ENDED') {
+        navigate(`/rooms/${roomId}/leaderboard`);
+        return;
+      }
+
+      if (!activeRoom.currentQuiz) {
+        throw new Error('Quiz not ready yet');
+      }
+
+      const questionsResponse = await api.getQuizQuestions(token, activeRoom.currentQuiz.id);
+      setQuestions(questionsResponse.data || []);
+      setSecondsRemaining(Number(activeRoom.currentQuiz.duration_seconds || 0));
+      setError('');
+    } catch (loadError) {
+      setError(loadError.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadQuiz();
+  }, [roomId, token]);
+
+  useEffect(() => {
+    const syncRoom = async () => {
+      try {
+        await emitSocket('SYNC_ROOM', { roomId: Number(roomId) });
+      } catch {
+        // Socket reconnects are handled elsewhere; this just primes the room join.
+      }
+    };
+
+    syncRoom();
+  }, [roomId]);
+
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket || socketStatus !== 'online') {
+      return undefined;
+    }
+
+    const handleQuizEnded = (payload) => {
+      if (Number(payload?.roomId) !== Number(roomId)) {
+        return;
+      }
+
+      navigate(`/rooms/${roomId}/leaderboard`);
+    };
+
+    socket.on('QUIZ_ENDED', handleQuizEnded);
+
+    return () => {
+      socket.off('QUIZ_ENDED', handleQuizEnded);
+    };
+  }, [navigate, roomId, socketStatus]);
+
+  useEffect(() => {
+    if (!secondsRemaining) {
+      return undefined;
+    }
+
+    const timer = setInterval(() => {
+      setSecondsRemaining((current) => {
+        const next = current <= 1 ? 0 : current - 1;
+        if (next === 0) {
+          clearInterval(timer);
+          setTimeout(() => navigate(`/rooms/${roomId}/leaderboard`), 0);
+        }
+        return next;
+      });
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [navigate, roomId, secondsRemaining]);
+
+  const currentQuestion = questions[currentIndex];
+  const isLastQuestion = currentIndex === questions.length - 1;
+
+  const handleSubmit = async () => {
+    if (!currentQuestion || !selectedOption || !room?.currentQuiz) {
+      return;
+    }
+
+    try {
+      const submission = await emitSocket('SUBMIT_ANSWER', {
+        roomId: Number(roomId),
+        questionId: Number(currentQuestion.id),
+        selectedOption,
+        quizId: Number(room.currentQuiz.id)
+      });
+
+      setResult(submission.data);
+
+      setTimeout(() => {
+        if (isLastQuestion) {
+          navigate(`/rooms/${roomId}/leaderboard`);
+          return;
+        }
+
+        setCurrentIndex((current) => current + 1);
+        setSelectedOption(null);
+        setResult(null);
+      }, 1000);
+    } catch (submitError) {
+      setError(submitError.message);
+    }
+  };
+
+  if (loading) {
+    return <main className="page-shell"><section className="page-card">Loading quiz...</section></main>;
+  }
+
+  return (
+    <main className="page-shell">
+      <section className="page-card quiz-layout">
+        <div className="page-header">
+          <div>
+            <p className="eyebrow">Player View</p>
+            <h1>Room {room?.room_code}</h1>
+            <p className="muted-copy">Answer each question once. Scores update when answers are submitted.</p>
+          </div>
+          <Timer seconds={secondsRemaining} />
+        </div>
+
+        {error ? <p className="form-error">{error}</p> : null}
+
+        <QuestionCard
+          question={currentQuestion}
+          questionNumber={currentIndex + 1}
+          totalQuestions={questions.length}
+          selectedOption={selectedOption}
+          onSelect={setSelectedOption}
+          onSubmit={handleSubmit}
+          isSubmitted={Boolean(result)}
+          result={result}
+        />
+
+        <div className="panel-card compact-panel">
+          <div className="panel-header">
+            <h3>Session Details</h3>
+            <span className="status-pill">Player #{user?.userId || user?.id}</span>
+          </div>
+          <p className="muted-copy">
+            Current quiz id: {room?.currentQuiz?.id}. Progress: {Math.min(currentIndex + 1, questions.length)} / {questions.length || 0}
+          </p>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+export default QuizPage;
